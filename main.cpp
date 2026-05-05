@@ -37,13 +37,13 @@ const int MAX_RETRY = 3;
 const int MAX_ROUND = 3;
 
 // RC mode threshold: Flycart 30 RC reports `mode` as a discrete switch position
-// (e.g. P/A/S/F mapped to large integer values). >= 8000 corresponds to the
+// (e.g. P/A/S/F mapped to large integer values). <= -8000 corresponds to the
 // upper switch position used as the "start RTH-to-new-home" trigger.
-const uint16_t RC_TRIGGER_MODE_THRESHOLD = 8000;
+const int16_t RC_TRIGGER_MODE_THRESHOLD = -8000;
 
 // Safety bound: stop monitoring landing after this duration so the script
 // never hangs in the field if telemetry never reports motors-stopped.
-const int LANDING_WAIT_TIMEOUT_S = 600;   // 3 min wait for engine-off after touchdown
+const int LANDING_WAIT_TIMEOUT_S = 600;   // 10 min wait for engine-off after touchdown
 
 T_DjiReturnCode DjiTest_FlightControlInit(void) {
     T_DjiReturnCode returnCode;
@@ -207,28 +207,24 @@ T_DjiReturnCode DjiTest_FlightControlDeInit(void)
     return DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS;
 }
 
-double toRadians(double degree) {
-    return degree * (M_PI / 180.0);
-}
+// Haversine great-circle distance, returns meters.
+// All four inputs MUST be in RADIANS — the natural unit of the formula.
+// Caller is responsible for normalizing inputs (PSDK telemetry is mixed:
+// HOME_POINT_INFO is rad, GPS_POSITION is deg*1e-7).
+double haversineDistanceRad(double lat1_rad, double lon1_rad,
+                            double lat2_rad, double lon2_rad) {
+    double dLat = lat2_rad - lat1_rad;
+    double dLon = lon2_rad - lon1_rad;
 
-double calculateHaversineDistance(double lat1, double lon1, double lat2, double lon2) {
-    //Find difference and convert to radians in lat and long
-    double dLat = toRadians(lat2 - lat1);
-    double dLon = toRadians(lon2 - lon1);
-    
-    //Convert lat to radians for both points
-    double rLat1 = toRadians(lat1);
-    double rLat2 = toRadians(lat2);
+    // a = sin²(dLat/2) + cos(lat1) * cos(lat2) * sin²(dLon/2)
+    double a = std::pow(std::sin(dLat / 2.0), 2) +
+               std::cos(lat1_rad) * std::cos(lat2_rad) *
+               std::pow(std::sin(dLon / 2.0), 2);
 
-    //Calculate haversine formula
-    // a = sin²(dlat/2) + cos(rLat1) ⋅ cos(rLat2) ⋅ sin²(dLon/2)
-    double a = std::pow(std::sin(dLat / 2.0), 2) + 
-               std::cos(rLat1) * std::cos(rLat2) * std::pow(std::sin(dLon / 2.0), 2);
-               
-    // c = 2 ⋅ atan2(√a, √(1−a))
+    // c = 2 * atan2(sqrt(a), sqrt(1-a))
     double c = 2.0 * std::atan2(std::sqrt(a), std::sqrt(1.0 - a));
-    
-    // real_distance (d = R ⋅ c)
+
+    // d = R * c
     return EARTH_RADIUS_M * c;
 }
 
@@ -238,7 +234,6 @@ int main(int argc, char** argv) {
     //Init PSDK and set up environment for flight controller sample
     Application application(argc, argv);
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
-    T_DjiReturnCode returnCode;
     T_DjiReturnCode djiStat;
     T_DjiFcSubscriptionRC rc_status = {0};
     T_DjiFcSubscriptionHomePointInfo home_point_info = {0};
@@ -249,7 +244,7 @@ int main(int argc, char** argv) {
     //param
     T_DjiFlightControllerHomeLocation location = {0};
     E_DjiFlightControllerGoHomeAltitude return_altitude =
-        static_cast<E_DjiFlightControllerGoHomeAltitude>(90);
+        static_cast<E_DjiFlightControllerGoHomeAltitude>(30);
     
     //init PSDK flight controller and subscription module
     USER_LOG_INFO("Init flight control and data subscription.");
@@ -261,29 +256,22 @@ int main(int argc, char** argv) {
     }
     osalHandler->TaskSleepMs(100);
 
-    //obtain joystick/control authority before sending flight commands
-    returnCode = DjiFlightController_ObtainJoystickCtrlAuthority();
-    if (returnCode != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-        USER_LOG_ERROR("Obtain joystick control authority failed, error code:0x%08llX", returnCode);
-        DjiTest_FlightControlDeInit();
-        return -1;
-    }
+    // NOTE: Joystick authority is NOT required here.
+    // All commands used (SetHomeLocation, SetGoHomeAltitude, StartGoHome, CancelGoHome)
+    // are high-level FC commands — they do NOT need joystick authority.
+    // Obtaining authority would also cause ReleaseAuthority to fail when RC
+    // is not in P_MODE (which is the case when the trigger switch is activated).
 
-    // Cleanup helper: release joystick authority + deinit subscriptions.
-    // Call before EVERY exit path after Obtain so authority never stays held
-    // by the PSDK app (would block pilot/FC from regaining control).
+    // Cleanup helper: deinit subscriptions and flight controller.
     auto cleanup = [&]() {
-        T_DjiReturnCode rc = DjiFlightController_ReleaseJoystickCtrlAuthority();
-        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            USER_LOG_ERROR("Release joystick control authority failed, error code:0x%08llX", rc);
-        }
+        USER_LOG_DEBUG("Deinit Flight Control / FC subscription.");
         DjiTest_FlightControlDeInit();
     };
 
     //TODO: How to get position from other hardware?
     //get new home location param from beacon and set new home location param
-    location.latitude = 10.05213215;
-    location.longitude = 102.1351658418;
+    location.latitude = 12.994319 * DJI_PI / 180;
+    location.longitude = 101.443273 * DJI_PI /180;
 
     // Wait for operator trigger from RC. This script is meant to run AFTER the
     // drone finishes its mission, so we wait indefinitely.
@@ -296,7 +284,7 @@ int main(int argc, char** argv) {
                                                         &timestamp);
         if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
             USER_LOG_ERROR("get value of topic rc error.");
-        } else if (rc_status.mode >= RC_TRIGGER_MODE_THRESHOLD) {
+        } else if (rc_status.mode <= RC_TRIGGER_MODE_THRESHOLD) {
             USER_LOG_INFO("Get trigger from remote, start to set home location and command drone go home");
             break;
         } else {
@@ -345,12 +333,15 @@ int main(int argc, char** argv) {
             USER_LOG_ERROR("get value of topic gps position error.");
         }
 
-        // GPS_POSITION: x = longitude, y = latitude in 1e-7 degrees (T_DjiVector3d int32)
-        double cur_lat_deg = gpsPosition.y * 1e-7;
-        double cur_lon_deg = gpsPosition.x * 1e-7;
-        double distance = calculateHaversineDistance(cur_lat_deg, cur_lon_deg,
-                                                     home_point_info.latitude,
-                                                     home_point_info.longitude);
+        // Normalize all inputs to RADIANS (the natural unit of Haversine):
+        //   - GPS_POSITION (T_DjiVector3d int32): x=lon, y=lat in deg*1e-7  → rad
+        //   - HOME_POINT_INFO (dji_f64_t): latitude/longitude already in rad
+        const double DEG_TO_RAD = M_PI / 180.0;
+        double cur_lat_rad = gpsPosition.y * 1e-7 * DEG_TO_RAD;
+        double cur_lon_rad = gpsPosition.x * 1e-7 * DEG_TO_RAD;
+        double distance = haversineDistanceRad(cur_lat_rad, cur_lon_rad,
+                                               home_point_info.latitude,
+                                               home_point_info.longitude);
 
         if (display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING) {
             if (distance <= LANDING_DISTANCE_THRESHOLD_M) {
@@ -445,7 +436,6 @@ int main(int argc, char** argv) {
                       LANDING_WAIT_TIMEOUT_S, flight_status);
     }
 
-    USER_LOG_DEBUG("Release authority and deinit Flight Control / FC subscription.");
     cleanup();
 
     return 0;
