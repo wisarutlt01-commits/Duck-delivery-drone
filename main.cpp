@@ -228,24 +228,68 @@ double haversineDistanceRad(double lat1_rad, double lon1_rad,
     return EARTH_RADIUS_M * c;
 }
 
+// State machine states for the auto-RTH workflow.
+enum RthState {
+    STATE_WAIT_TRIGGER,    // wait for operator RC switch trigger
+    STATE_SET_HOME,        // push new home GPS coords to FC
+    STATE_SET_ALTITUDE,    // push go-home altitude to FC
+    STATE_START_GO_HOME,   // command FC to begin RTH
+    STATE_MONITOR_RTH,     // watch RTH progress; on landing, check distance
+    STATE_WAIT_LANDING,    // wait for motors to stop after touchdown
+    STATE_DONE,            // success terminal state
+    STATE_ABORT_PILOT,     // pilot took control (P/A/M mode) — exit
+    STATE_ABORT_ERROR,     // unrecoverable error — exit
+};
+
+const char* stateName(RthState s) {
+    switch (s) {
+        case STATE_WAIT_TRIGGER:  return "WAIT_TRIGGER";
+        case STATE_SET_HOME:      return "SET_HOME";
+        case STATE_SET_ALTITUDE:  return "SET_ALTITUDE";
+        case STATE_START_GO_HOME: return "START_GO_HOME";
+        case STATE_MONITOR_RTH:   return "MONITOR_RTH";
+        case STATE_WAIT_LANDING:  return "WAIT_LANDING";
+        case STATE_DONE:          return "DONE";
+        case STATE_ABORT_PILOT:   return "ABORT_PILOT";
+        case STATE_ABORT_ERROR:   return "ABORT_ERROR";
+    }
+    return "?";
+}
+
+// True when display_mode means a human pilot is flying the drone (P/A/M).
+// If we see this DURING RTH execution, FC has dropped our control → bail out.
+bool isPilotControlMode(uint8_t mode) {
+    return mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_MANUAL_CTRL ||
+           mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_ATTITUDE ||
+           mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_P_GPS;
+}
+
+// States in which a switch to P/A/M mode means "pilot took over → abort".
+// WAIT_TRIGGER is excluded because we expect P-mode there (pre-trigger normal).
+bool isActiveRthState(RthState s) {
+    return s == STATE_SET_HOME || s == STATE_SET_ALTITUDE ||
+           s == STATE_START_GO_HOME || s == STATE_MONITOR_RTH ||
+           s == STATE_WAIT_LANDING;
+}
+
 int main(int argc, char** argv) {
-    std::cout << "Initial DJI PSDK...\n";  
+    USER_LOG_INFO("Initial Dynamic landing logic.");
 
     //Init PSDK and set up environment for flight controller sample
     Application application(argc, argv);
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
-    T_DjiReturnCode djiStat;
     T_DjiFcSubscriptionRC rc_status = {0};
     T_DjiFcSubscriptionHomePointInfo home_point_info = {0};
     T_DjiFcSubscriptionGpsPosition gpsPosition = {0};
     T_DjiFcSubscriptionDisplaymode display_mode = 0;
+    T_DjiFcSubscriptionFlightStatus flight_status = 0;
     T_DjiDataTimestamp timestamp = {0};
 
     //param
     T_DjiFlightControllerHomeLocation location = {0};
     E_DjiFlightControllerGoHomeAltitude return_altitude =
         static_cast<E_DjiFlightControllerGoHomeAltitude>(30);
-    
+
     //init PSDK flight controller and subscription module
     USER_LOG_INFO("Init flight control and data subscription.");
     T_DjiReturnCode init_fc = DjiTest_FlightControlInit();
@@ -256,187 +300,205 @@ int main(int argc, char** argv) {
     }
     osalHandler->TaskSleepMs(100);
 
-    // NOTE: Joystick authority is NOT required here.
-    // All commands used (SetHomeLocation, SetGoHomeAltitude, StartGoHome, CancelGoHome)
-    // are high-level FC commands — they do NOT need joystick authority.
-    // Obtaining authority would also cause ReleaseAuthority to fail when RC
-    // is not in P_MODE (which is the case when the trigger switch is activated).
-
-    // Cleanup helper: deinit subscriptions and flight controller.
+    // NOTE: Joystick authority is NOT required here. All commands used
+    // (SetHomeLocation, SetGoHomeAltitude, StartGoHome, CancelGoHome) are
+    // high-level FC commands — they do NOT need joystick authority.
     auto cleanup = [&]() {
         USER_LOG_DEBUG("Deinit Flight Control / FC subscription.");
         DjiTest_FlightControlDeInit();
     };
 
     //TODO: How to get position from other hardware?
-    //get new home location param from beacon and set new home location param
-    location.latitude = 12.994319 * DJI_PI / 180;
-    location.longitude = 101.443273 * DJI_PI /180;
+    location.latitude  = 12.994319 * DJI_PI / 180;
+    location.longitude = 101.443273 * DJI_PI / 180;
 
-    // Wait for operator trigger from RC. This script is meant to run AFTER the
-    // drone finishes its mission, so we wait indefinitely.
-    // Abort early if the drone is already in RTH or AUTO_LANDING — in that case
-    // some other system already took control and we must not override it.
-    while (true) {
-        djiStat = DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_RC,
-                                                        (uint8_t *) &rc_status,
-                                                        sizeof(T_DjiFcSubscriptionRC),
-                                                        &timestamp);
-        if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            USER_LOG_ERROR("get value of topic rc error.");
-        } else if (rc_status.mode <= RC_TRIGGER_MODE_THRESHOLD) {
-            USER_LOG_INFO("Get trigger from remote, start to set home location and command drone go home");
-            break;
-        } else {
-            USER_LOG_INFO("Waiting for trigger from remote, current rc mode is %d", rc_status.mode);
-        }
-
-        djiStat = DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE,
-                                                          (uint8_t *) &display_mode,
-                                                          sizeof(T_DjiFcSubscriptionDisplaymode),
-                                                          &timestamp);
-        if (djiStat == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS &&
-            (display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_NAVI_GO_HOME ||
-             display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING)) {
-            USER_LOG_WARN("Drone already in RTH/AUTO_LANDING (display_mode=%d) before trigger received. "
-                          "Aborting custom RTH script — pilot/FC has control.", display_mode);
-            cleanup();
-            return -1;
-        }
-
-        osalHandler->TaskSleepMs(1000/5); //5 hz
-    }
-        
+    // ===== State machine =====
+    RthState state = STATE_WAIT_TRIGGER;
+    RthState prev_state = STATE_DONE;  // sentinel != STATE_WAIT_TRIGGER, forces first-entry log
     int round = 0;
-    while (round < MAX_ROUND) {
-        djiStat = DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_INFO,
-                                                            (uint8_t *) &home_point_info,
-                                                            sizeof(T_DjiFcSubscriptionHomePointInfo),
-                                                            &timestamp);
-        if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            USER_LOG_ERROR("get value of topic home point info error.");
+    int retry_set_home = 0;
+    int retry_set_altitude = 0;
+
+    // Cooldown timestamps so retries don't hammer FC at 5Hz.
+    auto next_set_home_attempt = std::chrono::steady_clock::time_point::min();
+    auto next_set_altitude_attempt = std::chrono::steady_clock::time_point::min();
+
+    auto landing_deadline = std::chrono::steady_clock::time_point::max();
+
+    while (state != STATE_DONE && state != STATE_ABORT_PILOT && state != STATE_ABORT_ERROR) {
+        // Log on every state transition.
+        if (state != prev_state) {
+            USER_LOG_INFO("State transition: %s → %s", stateName(prev_state), stateName(state));
+            prev_state = state;
         }
 
-        djiStat = DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE,
-                                                            (uint8_t *) &display_mode,
-                                                            sizeof(T_DjiFcSubscriptionDisplaymode),
-                                                            &timestamp);
-        if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            USER_LOG_ERROR("get value of topic display mode error.");
+        // ---- Read telemetry every tick ----
+        DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_RC,
+            (uint8_t *) &rc_status, sizeof(rc_status), &timestamp);
+        DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_DISPLAYMODE,
+            (uint8_t *) &display_mode, sizeof(display_mode), &timestamp);
+        DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_HOME_POINT_INFO,
+            (uint8_t *) &home_point_info, sizeof(home_point_info), &timestamp);
+        DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION,
+            (uint8_t *) &gpsPosition, sizeof(gpsPosition), &timestamp);
+        DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT,
+            (uint8_t *) &flight_status, sizeof(flight_status), &timestamp);
+
+        // ---- Global pilot-takeover guard (highest priority) ----
+        // If the FC reports pilot control while we're in any active RTH state,
+        // exit immediately so we never fight the human on the sticks.
+        if (isActiveRthState(state) && isPilotControlMode(display_mode)) {
+            USER_LOG_WARN("Pilot took control mid-RTH (display_mode=%d). Aborting.", display_mode);
+            state = STATE_ABORT_PILOT;
+            continue;
         }
 
-        djiStat = DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_GPS_POSITION,
-                                                        (uint8_t *) &gpsPosition,
-                                                        sizeof(T_DjiFcSubscriptionGpsPosition),
-                                                        &timestamp);
-        if (djiStat != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-            USER_LOG_ERROR("get value of topic gps position error.");
-        }
-
-        // Normalize all inputs to RADIANS (the natural unit of Haversine):
-        //   - GPS_POSITION (T_DjiVector3d int32): x=lon, y=lat in deg*1e-7  → rad
-        //   - HOME_POINT_INFO (dji_f64_t): latitude/longitude already in rad
-        const double DEG_TO_RAD = M_PI / 180.0;
-        double cur_lat_rad = gpsPosition.y * 1e-7 * DEG_TO_RAD;
-        double cur_lon_rad = gpsPosition.x * 1e-7 * DEG_TO_RAD;
-        double distance = haversineDistanceRad(cur_lat_rad, cur_lon_rad,
-                                               home_point_info.latitude,
-                                               home_point_info.longitude);
-
-        if (display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING) {
-            if (distance <= LANDING_DISTANCE_THRESHOLD_M) {
-                USER_LOG_INFO("Drone has reached home point, distance to home point is %.2f meters", distance);
+        // ---- Per-state action ----
+        switch (state) {
+            case STATE_WAIT_TRIGGER: {
+                if (rc_status.mode <= RC_TRIGGER_MODE_THRESHOLD) {
+                    USER_LOG_INFO("Trigger received from RC. Starting RTH workflow.");
+                    state = STATE_SET_HOME;
+                } else if (display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_NAVI_GO_HOME ||
+                           display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING) {
+                    USER_LOG_WARN("Drone already in RTH/AUTO_LANDING (display_mode=%d) before trigger. Aborting.",
+                                  display_mode);
+                    state = STATE_ABORT_PILOT;
+                } else {
+                    USER_LOG_INFO("Waiting for trigger, current rc mode=%d", rc_status.mode);
+                }
                 break;
-            } else {
-                USER_LOG_INFO("Drone is landing, but has not reached home point, distance to home point is %.2f meters", distance);
-                T_DjiReturnCode result_command = DjiFlightController_CancelGoHome();
-                if (result_command != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                    USER_LOG_ERROR("Cannot cancel go home command. Pilot should take control!");
-                    cleanup();
-                    return -1;
+            }
+
+            case STATE_SET_HOME: {
+                if (round >= MAX_ROUND) {
+                    USER_LOG_ERROR("Exceeded MAX_ROUND=%d. Aborting.", MAX_ROUND);
+                    state = STATE_ABORT_ERROR;
+                    break;
                 }
-            }
-        }
+                if (std::chrono::steady_clock::now() < next_set_home_attempt) break;
 
-        if (display_mode != DJI_FC_SUBSCRIPTION_DISPLAY_MODE_NAVI_GO_HOME) {
-            USER_LOG_INFO("Round %d to set home location and command drone go home", round + 1);
-
-            //reset retry counters at the start of each round
-            int retry_set_home = 1;
-            int retry_set_home_altitude = 1;
-
-            USER_LOG_INFO("Setting new home location to FC");
-            T_DjiReturnCode set_home_result = DjiFlightController_SetHomeLocationUsingGPSCoordinates(location);
-            while (set_home_result != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                USER_LOG_ERROR("Cannot set new home location. Retry {%d}/%d", retry_set_home, MAX_RETRY);
-                set_home_result = DjiFlightController_SetHomeLocationUsingGPSCoordinates(location);
-                retry_set_home++;
-
-                if (retry_set_home > MAX_RETRY) {
-                    USER_LOG_ERROR("Maximum retry set home location. Pilot should take control!");
-                    cleanup();
-                    return -1;
+                USER_LOG_INFO("Round %d: setting new home location...", round + 1);
+                T_DjiReturnCode rc = DjiFlightController_SetHomeLocationUsingGPSCoordinates(location);
+                if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+                    retry_set_home = 0;
+                    state = STATE_SET_ALTITUDE;
+                } else {
+                    retry_set_home++;
+                    USER_LOG_ERROR("SetHome failed (0x%08llX). Retry %d/%d", rc, retry_set_home, MAX_RETRY);
+                    if (retry_set_home > MAX_RETRY) {
+                        state = STATE_ABORT_ERROR;
+                    } else {
+                        next_set_home_attempt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    }
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                break;
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            //setting go home altitude
-            USER_LOG_INFO("Setting go home altitude to FC");
-            T_DjiReturnCode set_home_altitude_result = DjiFlightController_SetGoHomeAltitude(return_altitude);
-            while (set_home_altitude_result != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                USER_LOG_ERROR("Cannot set new home altitude. Retry {%d}/%d", retry_set_home_altitude, MAX_RETRY);
-                set_home_altitude_result = DjiFlightController_SetGoHomeAltitude(return_altitude);
-                retry_set_home_altitude++;
+            case STATE_SET_ALTITUDE: {
+                if (std::chrono::steady_clock::now() < next_set_altitude_attempt) break;
 
-                if (retry_set_home_altitude > MAX_RETRY) {
-                    USER_LOG_ERROR("Maximum retry set home altitude. Pilot should take control!");
-                    cleanup();
-                    return -1;
+                USER_LOG_INFO("Setting go-home altitude...");
+                T_DjiReturnCode rc = DjiFlightController_SetGoHomeAltitude(return_altitude);
+                if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+                    retry_set_altitude = 0;
+                    state = STATE_START_GO_HOME;
+                } else {
+                    retry_set_altitude++;
+                    USER_LOG_ERROR("SetAltitude failed (0x%08llX). Retry %d/%d",
+                                   rc, retry_set_altitude, MAX_RETRY);
+                    if (retry_set_altitude > MAX_RETRY) {
+                        state = STATE_ABORT_ERROR;
+                    } else {
+                        next_set_altitude_attempt = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+                    }
                 }
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+                break;
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
 
-            //command drone go home
-            USER_LOG_INFO("Command drone go new home location");
-            T_DjiReturnCode result_command = DjiFlightController_StartGoHome();
-            if (result_command != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
-                USER_LOG_ERROR("Cannot command drone to go home");
-                cleanup();
-                return -1;
+            case STATE_START_GO_HOME: {
+                USER_LOG_INFO("Commanding drone to go home...");
+                T_DjiReturnCode rc = DjiFlightController_StartGoHome();
+                if (rc == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+                    round++;
+                    state = STATE_MONITOR_RTH;
+                } else {
+                    USER_LOG_ERROR("StartGoHome failed (0x%08llX).", rc);
+                    state = STATE_ABORT_ERROR;
+                }
+                break;
             }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            round++;
+
+            case STATE_MONITOR_RTH: {
+                // Compute distance: GPS (deg*1e-7) and home (rad) → both to rad.
+                const double DEG_TO_RAD = M_PI / 180.0;
+                double cur_lat_rad = gpsPosition.y * 1e-7 * DEG_TO_RAD;
+                double cur_lon_rad = gpsPosition.x * 1e-7 * DEG_TO_RAD;
+                double distance = haversineDistanceRad(cur_lat_rad, cur_lon_rad,
+                                                       home_point_info.latitude,
+                                                       home_point_info.longitude);
+
+                if (display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING) {
+                    if (distance <= LANDING_DISTANCE_THRESHOLD_M) {
+                        USER_LOG_INFO("Reached home (distance=%.2f m). Letting it land.", distance);
+                        landing_deadline = std::chrono::steady_clock::now() +
+                                           std::chrono::seconds(LANDING_WAIT_TIMEOUT_S);
+                        state = STATE_WAIT_LANDING;
+                    } else {
+                        USER_LOG_WARN("Landing far from home (distance=%.2f m). Cancel + retry.", distance);
+                        T_DjiReturnCode rc = DjiFlightController_CancelGoHome();
+                        if (rc != DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS) {
+                            USER_LOG_ERROR("CancelGoHome failed (0x%08llX).", rc);
+                            state = STATE_ABORT_ERROR;
+                        } else {
+                            state = STATE_SET_HOME;  // round-bound check happens in SET_HOME
+                        }
+                    }
+                }
+                // else: still climbing/cruising in NAVI_GO_HOME — keep monitoring.
+                break;
+            }
+
+            case STATE_WAIT_LANDING: {
+                if (flight_status == DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_STOPED) {
+                    USER_LOG_INFO("Landing complete, motors stopped.");
+                    state = STATE_DONE;
+                } else if (std::chrono::steady_clock::now() > landing_deadline) {
+                    USER_LOG_WARN("Landing wait timed out after %d s (flight_status=%d). Exiting.",
+                                  LANDING_WAIT_TIMEOUT_S, flight_status);
+                    state = STATE_DONE;
+                }
+                break;
+            }
+
+            case STATE_DONE:
+            case STATE_ABORT_PILOT:
+            case STATE_ABORT_ERROR:
+                break; // unreachable inside loop
         }
 
         osalHandler->TaskSleepMs(1000/5); //5 hz
     }
 
-    //wait for landing to complete (flight status == STOPED) before tearing down,
-    //so we don't unsubscribe topics while the FC still needs them mid-landing.
-    USER_LOG_INFO("Waiting for landing to complete before deinit...");
-    auto landing_deadline = std::chrono::steady_clock::now() +
-                            std::chrono::seconds(LANDING_WAIT_TIMEOUT_S);
-    T_DjiFcSubscriptionFlightStatus flight_status = 0;
-    while (std::chrono::steady_clock::now() < landing_deadline) {
-        djiStat = DjiFcSubscription_GetLatestValueOfTopic(DJI_FC_SUBSCRIPTION_TOPIC_STATUS_FLIGHT,
-                                                          (uint8_t *) &flight_status,
-                                                          sizeof(T_DjiFcSubscriptionFlightStatus),
-                                                          &timestamp);
-        if (djiStat == DJI_ERROR_SYSTEM_MODULE_CODE_SUCCESS &&
-            flight_status == DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_STOPED) {
-            USER_LOG_INFO("Landing complete, motors stopped.");
+    // ---- Terminal handling ----
+    int exit_code = 0;
+    switch (state) {
+        case STATE_DONE:
+            USER_LOG_INFO("RTH workflow completed successfully.");
             break;
-        }
-        osalHandler->TaskSleepMs(1000/5); //5 hz
-    }
-    if (flight_status != DJI_FC_SUBSCRIPTION_FLIGHT_STATUS_STOPED) {
-        USER_LOG_WARN("Landing wait timed out after %d seconds (flight_status=%d). Continuing to deinit anyway.",
-                      LANDING_WAIT_TIMEOUT_S, flight_status);
+        case STATE_ABORT_PILOT:
+            USER_LOG_WARN("RTH aborted: pilot/FC took control.");
+            exit_code = -1;
+            break;
+        case STATE_ABORT_ERROR:
+            USER_LOG_ERROR("RTH aborted: unrecoverable error.");
+            exit_code = -1;
+            break;
+        default:
+            exit_code = -1;
+            break;
     }
 
     cleanup();
-
-    return 0;
+    return exit_code;
 }
