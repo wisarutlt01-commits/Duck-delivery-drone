@@ -231,6 +231,7 @@ double haversineDistanceRad(double lat1_rad, double lon1_rad,
 // State machine states for the auto-RTH workflow.
 enum RthState {
     STATE_WAIT_TRIGGER,    // wait for operator RC switch trigger
+    STATE_GET_LOCATION,    // fetch target landing coordinates (hardcoded now; replace with real source later)
     STATE_SET_HOME,        // push new home GPS coords to FC
     STATE_SET_ALTITUDE,    // push go-home altitude to FC
     STATE_START_GO_HOME,   // command FC to begin RTH
@@ -244,6 +245,7 @@ enum RthState {
 const char* stateName(RthState s) {
     switch (s) {
         case STATE_WAIT_TRIGGER:  return "WAIT_TRIGGER";
+        case STATE_GET_LOCATION:  return "GET_LOCATION";
         case STATE_SET_HOME:      return "SET_HOME";
         case STATE_SET_ALTITUDE:  return "SET_ALTITUDE";
         case STATE_START_GO_HOME: return "START_GO_HOME";
@@ -267,7 +269,7 @@ bool isPilotControlMode(uint8_t mode) {
 // States in which a switch to P/A/M mode means "pilot took over → abort".
 // WAIT_TRIGGER is excluded because we expect P-mode there (pre-trigger normal).
 bool isActiveRthState(RthState s) {
-    return s == STATE_SET_HOME || s == STATE_SET_ALTITUDE ||
+    return s == STATE_GET_LOCATION || s == STATE_SET_HOME || s == STATE_SET_ALTITUDE ||
            s == STATE_START_GO_HOME || s == STATE_MONITOR_RTH ||
            s == STATE_WAIT_LANDING;
 }
@@ -275,7 +277,7 @@ bool isActiveRthState(RthState s) {
 int main(int argc, char** argv) {
     USER_LOG_INFO("Initial Dynamic landing logic.");
 
-    //Init PSDK and set up environment for flight controller sample
+    //Init PSDK and set up environment
     Application application(argc, argv);
     T_DjiOsalHandler *osalHandler = DjiPlatform_GetOsalHandler();
     T_DjiFcSubscriptionRC rc_status = {0};
@@ -308,16 +310,13 @@ int main(int argc, char** argv) {
         DjiTest_FlightControlDeInit();
     };
 
-    //TODO: How to get position from other hardware?
-    location.latitude  = 12.994319 * DJI_PI / 180;
-    location.longitude = 101.443273 * DJI_PI / 180;
-
     // ===== State machine =====
     RthState state = STATE_WAIT_TRIGGER;
     RthState prev_state = STATE_DONE;  // sentinel != STATE_WAIT_TRIGGER, forces first-entry log
     int round = 0;
     int retry_set_home = 0;
     int retry_set_altitude = 0;
+    bool waiting_release = false;  // wait for RC switch to release before accepting next trigger
 
     // Cooldown timestamps so retries don't hammer FC at 5Hz.
     auto next_set_home_attempt = std::chrono::steady_clock::time_point::min();
@@ -325,7 +324,20 @@ int main(int argc, char** argv) {
 
     auto landing_deadline = std::chrono::steady_clock::time_point::max();
 
-    while (state != STATE_DONE && state != STATE_ABORT_PILOT && state != STATE_ABORT_ERROR) {
+    // Helper: reset all per-round counters and return to WAIT_TRIGGER.
+    // Called from DONE and ABORT_PILOT so the loop runs continuously.
+    auto resetForNextRound = [&]() {
+        round = 0;
+        retry_set_home = 0;
+        retry_set_altitude = 0;
+        next_set_home_attempt = std::chrono::steady_clock::time_point::min();
+        next_set_altitude_attempt = std::chrono::steady_clock::time_point::min();
+        landing_deadline = std::chrono::steady_clock::time_point::max();
+        waiting_release = true;  // don't re-trigger until switch is released
+        state = STATE_WAIT_TRIGGER;
+    };
+
+    while (state != STATE_ABORT_ERROR) {
         // Log on every state transition.
         if (state != prev_state) {
             USER_LOG_INFO("State transition: %s → %s", stateName(prev_state), stateName(state));
@@ -356,9 +368,18 @@ int main(int argc, char** argv) {
         // ---- Per-state action ----
         switch (state) {
             case STATE_WAIT_TRIGGER: {
+                if (waiting_release) {
+                    // After a completed or aborted run, require the operator
+                    // to release the switch before we accept a new trigger.
+                    if (rc_status.mode > RC_TRIGGER_MODE_THRESHOLD) {
+                        waiting_release = false;
+                        USER_LOG_INFO("RC switch released. Ready for next trigger.");
+                    }
+                    break;
+                }
                 if (rc_status.mode <= RC_TRIGGER_MODE_THRESHOLD) {
                     USER_LOG_INFO("Trigger received from RC. Starting RTH workflow.");
-                    state = STATE_SET_HOME;
+                    state = STATE_GET_LOCATION;
                 } else if (display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_NAVI_GO_HOME ||
                            display_mode == DJI_FC_SUBSCRIPTION_DISPLAY_MODE_AUTO_LANDING) {
                     USER_LOG_WARN("Drone already in RTH/AUTO_LANDING (display_mode=%d) before trigger. Aborting.",
@@ -367,6 +388,19 @@ int main(int argc, char** argv) {
                 } else {
                     USER_LOG_INFO("Waiting for trigger, current rc mode=%d", rc_status.mode);
                 }
+                break;
+            }
+
+            case STATE_GET_LOCATION: {
+                // TODO: Replace this block with real location source, e.g.:
+                //   - Read from serial/UART (external GPS or operator device)
+                //   - Read from file / shared memory written by another process
+                //   - Fetch from network (REST API, MQTT, etc.)
+                location.latitude  = 12.994319 * DJI_PI / 180.0;
+                location.longitude = 101.443273 * DJI_PI / 180.0;
+                USER_LOG_INFO("Got target location: lat=%.6f rad, lon=%.6f rad",
+                              location.latitude, location.longitude);
+                state = STATE_SET_HOME;
                 break;
             }
 
@@ -472,33 +506,24 @@ int main(int argc, char** argv) {
             }
 
             case STATE_DONE:
+                USER_LOG_INFO("RTH complete. Release RC switch to next trigger.");
+                resetForNextRound();
+                break;
+
             case STATE_ABORT_PILOT:
+                USER_LOG_WARN("RTH aborted (pilot control). Release RC switch to re-trigger.");
+                resetForNextRound();
+                break;
+
             case STATE_ABORT_ERROR:
-                break; // unreachable inside loop
+                break; // exits the while loop
         }
 
         osalHandler->TaskSleepMs(1000/5); //5 hz
     }
 
-    // ---- Terminal handling ----
-    int exit_code = 0;
-    switch (state) {
-        case STATE_DONE:
-            USER_LOG_INFO("RTH workflow completed successfully.");
-            break;
-        case STATE_ABORT_PILOT:
-            USER_LOG_WARN("RTH aborted: pilot/FC took control.");
-            exit_code = -1;
-            break;
-        case STATE_ABORT_ERROR:
-            USER_LOG_ERROR("RTH aborted: unrecoverable error.");
-            exit_code = -1;
-            break;
-        default:
-            exit_code = -1;
-            break;
-    }
-
+    // Only STATE_ABORT_ERROR exits the loop.
+    USER_LOG_ERROR("RTH aborted: unrecoverable error.");
     cleanup();
-    return exit_code;
+    return -1;
 }
